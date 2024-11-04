@@ -1,7 +1,7 @@
-;; Luxury Goods Authentication System - Phase 2
-;; Version: 0.2
-;; Focus: Ownership and transfer functionality
-;; Building on Phase 1
+;; Luxury Goods Authentication System - Phase 3
+;; Version: 0.3
+;; Focus: Comprehensive history tracking system
+;; Building on Phase 1 & 2
 
 ;; ========= Constants =========
 (define-constant CONTRACT_OWNER tx-sender)
@@ -10,10 +10,28 @@
 (define-constant ERR_NOT_FOUND (err u102))
 (define-constant ERR_ALREADY_EXISTS (err u103))
 (define-constant ERR_INVALID_TRANSFER (err u104))
-(define-constant ERR_PRODUCT_LOCKED (err u105))
+(define-constant ERR_INVALID_HISTORY (err u105))
+(define-constant MAX_HISTORY_SEARCH u50)
+
+;; ========= Data Types =========
+;; Define action types for history tracking
+(define-data-var valid-actions (list 20 (string-utf8 20)) 
+    (list 
+        "created"
+        "transferred"
+        "locked"
+        "unlocked"
+        "status-changed"
+        "verified"
+        "flagged"
+        "unflagged"
+        "manufacturer-action"
+        "retailer-action"
+    )
+)
 
 ;; ========= Data Maps =========
-;; Enhanced products map with ownership tracking
+;; Core product data (inherited from previous phases)
 (define-map products 
     {serial-number: (string-utf8 50)}
     {
@@ -22,228 +40,244 @@
         manufacturer: principal,
         timestamp: uint,
         status: (string-utf8 20),
-        current-owner: principal,
-        transfer-locked: bool,
-        last-transfer: uint
+        current-owner: principal
     }
 )
 
-;; Authorization maps (carried over from Phase 1)
-(define-map manufacturers principal bool)
-(define-map retailers principal bool)
-
-;; Transfer history tracking
-(define-map ownership-history
-    {serial-number: (string-utf8 50), transfer-id: uint}
+;; Comprehensive event history tracking
+(define-map product-history
+    {serial-number: (string-utf8 50), index: uint}
     {
-        from: principal,
-        to: principal,
         timestamp: uint,
-        price: (optional uint),
-        transfer-type: (string-utf8 20)
+        action: (string-utf8 20),
+        actor: principal,
+        details: (optional (string-utf8 256)),
+        data: (optional {
+            old-value: (string-utf8 50),
+            new-value: (string-utf8 50)
+        })
     }
 )
 
-;; Track transfer counts per product
-(define-map transfer-counts
+;; Track history indices per product
+(define-map history-indices
     (string-utf8 50)  ;; serial-number
-    uint              ;; number of transfers
+    {
+        total-events: uint,
+        last-timestamp: uint,
+        first-timestamp: uint
+    }
+)
+
+;; Track specific event types per product
+(define-map event-type-indices
+    {serial-number: (string-utf8 50), action: (string-utf8 20)}
+    (list 50 uint)  ;; List of indices for specific event type
 )
 
 ;; ========= Read-Only Functions =========
-;; Enhanced product query
-(define-read-only (get-product (serial-number (string-utf8 50)))
-    (map-get? products {serial-number: serial-number})
-)
-
-;; Get current owner
-(define-read-only (get-current-owner (serial-number (string-utf8 50)))
-    (match (get-product serial-number)
-        product (ok (get current-owner product))
-        ERR_NOT_FOUND
-    )
-)
-
-;; Get transfer history
-(define-read-only (get-transfer
+;; Get single history entry
+(define-read-only (get-history-entry 
     (serial-number (string-utf8 50))
-    (transfer-id uint))
-    (map-get? ownership-history 
-        {serial-number: serial-number, transfer-id: transfer-id}
+    (index uint))
+    (map-get? product-history {serial-number: serial-number, index: index})
+)
+
+;; Get history summary
+(define-read-only (get-history-summary (serial-number (string-utf8 50)))
+    (map-get? history-indices serial-number)
+)
+
+;; Get event type history
+(define-read-only (get-events-by-type 
+    (serial-number (string-utf8 50))
+    (action (string-utf8 20)))
+    (map-get? event-type-indices {serial-number: serial-number, action: action})
+)
+
+;; Get history range
+(define-read-only (get-history-range
+    (serial-number (string-utf8 50))
+    (start-index uint)
+    (end-index uint))
+    
+    (let
+        (
+            (summary (unwrap! (get-history-summary serial-number) ERR_NOT_FOUND))
+            (max-index (get total-events summary))
+        )
+        ;; Validate range
+        (if (and 
+                (<= start-index end-index)
+                (< end-index max-index)
+                (<= (- end-index start-index) MAX_HISTORY_SEARCH))
+            (ok (filter not-none 
+                (map unwrap-panic
+                    (map (lambda (index)
+                        (get-history-entry serial-number index))
+                        (list start-index end-index)))))
+            ERR_INVALID_HISTORY)
     )
 )
 
-;; Get total transfers
-(define-read-only (get-transfer-count (serial-number (string-utf8 50)))
-    (default-to u0 (map-get? transfer-counts serial-number))
-)
-
-;; Check if product is locked for transfer
-(define-read-only (is-transfer-locked (serial-number (string-utf8 50)))
-    (match (get-product serial-number)
-        product (get transfer-locked product)
-        false
+;; ========= History Recording Functions =========
+;; Record a new history event
+(define-private (record-history-event
+    (serial-number (string-utf8 50))
+    (action (string-utf8 20))
+    (details (optional (string-utf8 256)))
+    (data (optional {
+        old-value: (string-utf8 50),
+        new-value: (string-utf8 50)
+    })))
+    
+    (let
+        (
+            (current-summary (default-to 
+                {
+                    total-events: u0,
+                    last-timestamp: u0,
+                    first-timestamp: (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_INPUT)
+                } 
+                (get-history-summary serial-number)))
+            (new-index (get total-events current-summary))
+            (timestamp (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_INPUT))
+        )
+        
+        ;; Record the event
+        (try! (map-set product-history
+            {serial-number: serial-number, index: new-index}
+            {
+                timestamp: timestamp,
+                action: action,
+                actor: tx-sender,
+                details: details,
+                data: data
+            }))
+        
+        ;; Update indices
+        (try! (map-set history-indices
+            serial-number
+            {
+                total-events: (+ new-index u1),
+                last-timestamp: timestamp,
+                first-timestamp: (get first-timestamp current-summary)
+            }))
+        
+        ;; Update event type indices
+        (let
+            (
+                (current-type-indices (default-to (list) 
+                    (get-events-by-type serial-number action)))
+            )
+            (map-set event-type-indices
+                {serial-number: serial-number, action: action}
+                (append current-type-indices new-index))
+        )
+        
+        (ok new-index)
     )
 )
 
-;; ========= Ownership Management Functions =========
-;; Register product with ownership
+;; ========= Enhanced Product Management =========
+;; Enhanced product registration with history
 (define-public (register-product 
     (serial-number (string-utf8 50))
     (brand (string-utf8 50))
     (model (string-utf8 50)))
     
-    (let
-        (
-            (manufacturer tx-sender)
-            (timestamp (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_INPUT))
-        )
-        
-        (asserts! (is-manufacturer manufacturer) ERR_NOT_AUTHORIZED)
-        (asserts! (is-none (get-product serial-number)) ERR_ALREADY_EXISTS)
-        
-        ;; Initialize product with ownership
+    (begin
+        ;; Original registration logic
         (try! (map-set products
             {serial-number: serial-number}
             {
                 brand: brand,
                 model: model,
-                manufacturer: manufacturer,
-                timestamp: timestamp,
+                manufacturer: tx-sender,
+                timestamp: (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_INPUT),
                 status: "active",
-                current-owner: manufacturer,
-                transfer-locked: false,
-                last-transfer: timestamp
-            }
-        ))
+                current-owner: tx-sender
+            }))
         
-        ;; Initialize transfer history
-        (try! (map-set ownership-history
-            {serial-number: serial-number, transfer-id: u0}
-            {
-                from: manufacturer,
-                to: manufacturer,
-                timestamp: timestamp,
-                price: none,
-                transfer-type: "registration"
-            }
-        ))
-        
-        ;; Initialize transfer count
-        (map-set transfer-counts serial-number u1)
+        ;; Record creation in history
+        (try! (record-history-event
+            serial-number
+            "created"
+            (some "Initial product registration")
+            (some {
+                old-value: "",
+                new-value: brand
+            })))
         
         (ok true)
     )
 )
 
-;; Transfer ownership
-(define-public (transfer-ownership
+;; Enhanced status update with history
+(define-public (update-product-status
     (serial-number (string-utf8 50))
-    (new-owner principal)
-    (price (optional uint)))
+    (new-status (string-utf8 20)))
     
     (let
         (
             (product (unwrap! (get-product serial-number) ERR_NOT_FOUND))
-            (timestamp (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_INPUT))
-            (current-count (get-transfer-count serial-number))
+            (old-status (get status product))
         )
-        
-        ;; Validation checks
-        (asserts! (is-eq (get current-owner product) tx-sender) ERR_NOT_AUTHORIZED)
-        (asserts! (not (get transfer-locked product)) ERR_PRODUCT_LOCKED)
-        (asserts! (not (is-eq new-owner tx-sender)) ERR_INVALID_TRANSFER)
-        
-        ;; Update product ownership
+        ;; Update status
         (try! (map-set products
             {serial-number: serial-number}
-            (merge product {
-                current-owner: new-owner,
-                last-transfer: timestamp
-            })
-        ))
+            (merge product {status: new-status})))
         
-        ;; Record transfer in history
-        (try! (map-set ownership-history
-            {serial-number: serial-number, transfer-id: current-count}
-            {
-                from: tx-sender,
-                to: new-owner,
-                timestamp: timestamp,
-                price: price,
-                transfer-type: "standard"
-            }
-        ))
-        
-        ;; Update transfer count
-        (map-set transfer-counts serial-number (+ current-count u1))
+        ;; Record status change in history
+        (try! (record-history-event
+            serial-number
+            "status-changed"
+            none
+            (some {
+                old-value: old-status,
+                new-value: new-status
+            })))
         
         (ok true)
     )
 )
 
-;; Lock/unlock transfers
-(define-public (set-transfer-lock
+;; ========= History Query Functions =========
+;; Get all events of a specific type
+(define-read-only (query-events-by-type
     (serial-number (string-utf8 50))
-    (locked bool))
+    (action (string-utf8 20))
+    (limit uint))
     
     (let
         (
-            (product (unwrap! (get-product serial-number) ERR_NOT_FOUND))
+            (indices (get-events-by-type serial-number action))
         )
-        
-        ;; Only current owner can lock/unlock
-        (asserts! (is-eq (get current-owner product) tx-sender) ERR_NOT_AUTHORIZED)
-        
-        (ok (map-set products
-            {serial-number: serial-number}
-            (merge product {
-                transfer-locked: locked
-            })
-        ))
+        (match indices
+            indices-list
+            (ok (map unwrap-panic
+                (map (lambda (index)
+                    (get-history-entry serial-number index))
+                    (take (default-to (list) indices-list) limit))))
+            ERR_NOT_FOUND)
     )
 )
 
-;; Force transfer (manufacturer only)
-(define-public (force-transfer
+;; Get recent history
+(define-read-only (get-recent-history
     (serial-number (string-utf8 50))
-    (new-owner principal))
+    (limit uint))
     
     (let
         (
-            (product (unwrap! (get-product serial-number) ERR_NOT_FOUND))
-            (timestamp (unwrap! (get-block-info? time (- block-height u1)) ERR_INVALID_INPUT))
-            (current-count (get-transfer-count serial-number))
+            (summary (unwrap! (get-history-summary serial-number) ERR_NOT_FOUND))
+            (total (get total-events summary))
         )
-        
-        ;; Only manufacturer can force transfer
-        (asserts! (is-eq (get manufacturer product) tx-sender) ERR_NOT_AUTHORIZED)
-        
-        ;; Update ownership
-        (try! (map-set products
-            {serial-number: serial-number}
-            (merge product {
-                current-owner: new-owner,
-                last-transfer: timestamp,
-                transfer-locked: false
-            })
-        ))
-        
-        ;; Record forced transfer
-        (try! (map-set ownership-history
-            {serial-number: serial-number, transfer-id: current-count}
-            {
-                from: (get current-owner product),
-                to: new-owner,
-                timestamp: timestamp,
-                price: none,
-                transfer-type: "forced"
-            }
-        ))
-        
-        ;; Update transfer count
-        (map-set transfer-counts serial-number (+ current-count u1))
-        
-        (ok true)
+        (if (> total u0)
+            (get-history-range 
+                serial-number
+                (if (> total limit) (- total limit) u0)
+                (- total u1))
+            (ok (list)))
     )
 )
