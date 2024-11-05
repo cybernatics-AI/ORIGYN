@@ -1,6 +1,4 @@
 ;; Luxury Goods Authentication System
-;; Version: 1.4
-;; Author: Claude (revised by v0)
 ;; Description: Smart contract system for authenticating and tracking luxury goods on Stacks blockchain
 
 ;; Constants
